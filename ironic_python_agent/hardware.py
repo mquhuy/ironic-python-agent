@@ -651,27 +651,31 @@ def list_all_block_devices(block_type='disk',
             udev = pyudev.Devices.from_device_file(context, name)
         except pyudev.DeviceNotFoundByFileError as e:
             LOG.warning("Device %(dev)s is inaccessible, skipping... "
-                        "Error: %(error)s", {'dev': name, 'error': e})
+                "Error: %(error)s", {'dev': name, 'error': e})
         except pyudev.DeviceNotFoundByNumberError as e:
             LOG.warning("Device %(dev)s is not supported by pyudev, "
-                        "skipping... Error: %(error)s",
-                        {'dev': name, 'error': e})
+                "skipping... Error: %(error)s",
+                {'dev': name, 'error': e})
+        # There could a situation arise based on empirical data when
+        # the serial number is not present in ID_SERIAL_SHORT but instead
+        # it is present in some other hardware specific variable.
         else:
-            # TODO(lucasagomes): Since lsblk only supports
-            # returning the short serial we are using
-            # ID_SERIAL_SHORT first to keep compatibility with the
-            # bash deploy ramdisk
-            for key, udev_key in [
-                ('serial', 'SERIAL_SHORT'),
-                ('serial', 'SERIAL'),
-                ('wwn', 'WWN'),
-                ('wwn_with_extension', 'WWN_WITH_EXTENSION'),
-                ('wwn_vendor_extension', 'WWN_VENDOR_EXTENSION')
-            ]:
+            udev_property_mappings = [('serial','SERIAL_SHORT'),
+                ('serial','SERIAL'),
+                ('wwn','WWN'),
+                ('wwn_with_extension','WWN_WITH_EXTENSION'),
+                ('wwn_vendor_extension','WWN_VENDOR_EXTENSION')]
+            serials = []
+            for prop in udev.properties:
+                if prop.__contains__("SERIAL"):
+                    serials.append(udev.get(prop))
+            extra['all_serials'] = serials
+
+            for key, udev_key in udev_property_mappings:
                 if key in extra:
                     continue
                 value = (udev.get(f'ID_{udev_key}')
-                         or udev.get(f'DM_{udev_key}'))  # devicemapper
+                    or udev.get(f'DM_{udev_key}'))  # devicemapper
                 if value:
                     extra[key] = value
 
@@ -761,7 +765,7 @@ class BlockDevice(encoding.SerializableComparable):
                            'wwn', 'serial', 'vendor', 'wwn_with_extension',
                            'wwn_vendor_extension', 'hctl', 'by_path')
 
-    def __init__(self, name, model, size, rotational, wwn=None, serial=None,
+    def __init__(self, name, model, size, rotational, all_serials=None, wwn=None, serial=None,
                  vendor=None, wwn_with_extension=None,
                  wwn_vendor_extension=None, hctl=None, by_path=None,
                  uuid=None, partuuid=None):
@@ -778,7 +782,23 @@ class BlockDevice(encoding.SerializableComparable):
         self.hctl = hctl
         self.by_path = by_path
         self.partuuid = partuuid
+        self.all_serials = all_serials
 
+    def shuffle_dropp_serial(self):
+        if self.serial is not None and self.serial != "":
+            self.all_serials.remove(self.serial)
+            self.serial = ""
+        if self.all_serials is not None and len(self.all_serials) > 0:
+            self.serial = self.all_serials[0]
+
+    @classmethod
+    def max_serial_num(cls, block_devices):
+        maximum = 0
+        for dev in block_devices:
+            dev_serials_num = len(dev.all_serials)
+            if  dev_serials_num > maximum:
+                maximum = dev_serials_num
+        return maximum
 
 class NetworkInterface(encoding.SerializableComparable):
     serializable_fields = ('name', 'mac_address', 'ipv4_address',
@@ -1448,9 +1468,25 @@ class GenericHardwareManager(HardwareManager):
                     '%(error)s' % {'hints': root_device_hints, 'error': e})
 
             if not device:
-                raise errors.DeviceNotFound(
-                    "No suitable device was found for "
-                    "deployment using these hints %s" % root_device_hints)
+                hint = root_device_hints.get('serial', None)
+                LOG.info('root device hints %(hints)s',
+                         {'hints': root_device_hints})
+                if hint is not None:
+                    LOG.info("Serial sarch extended!!!!")
+                    max_serial_num = BlockDevice.max_serial_num(block_devices)
+                    for i in range(max_serial_num):
+                        for dev in block_devices:
+                            dev.shuffle_dropp_serial()
+                        LOG.info("Shuffled serials!!!!")
+                        serialized_devs = [dev.serialize() for dev in block_devices]
+                        device = il_utils.match_root_device_hints(serialized_devs,
+                                                          root_device_hints)
+                        if device:
+                            break
+            if not device:
+                    raise errors.DeviceNotFound(
+                        "No suitable device was found for "
+                        "deployment using these hints %s" % root_device_hints)
 
             dev_name = device['name']
 
